@@ -68,8 +68,18 @@ def creator(v):
 
 @app.get("/manifest.json")
 def manifest():
-    return jsonify({"id":"layzxz.bitchord-flac","name":"Layz Add On","version":"1.0.0","resources":["search","stream"],
-      "settings":[{"key":"quality","type":"select","default":"lossless","options":[{"label":"Lossless","value":"lossless"},{"label":"High","value":"high"},{"label":"Low","value":"low"}]}]})
+    return jsonify({
+        "id":"layzxz.bitchord-flac",
+        "name":"Layz Add On",
+        "version":"1.1.0",
+        "resources":["search","stream"],
+        "settings":[{
+            "key":"quality",
+            "type":"select",
+            "default":"lossless",
+            "options":[{"label":"Lossless","value":"lossless"}]
+        }]
+    })
 
 @app.get("/health")
 def health(): return jsonify({"ok":True})
@@ -83,8 +93,8 @@ def search():
         r=S.get(
             SEARCH,
             params={
-                "q":f"mediatype:audio AND ({q})",
-                "fl[]":["identifier","title","creator","album","length"],
+                "q":f"mediatype:audio AND format:flac AND ({q})",
+                "fl[]":["identifier","title","creator","album","length","format"],
                 "rows":20,
                 "output":"json"
             },
@@ -97,6 +107,10 @@ def search():
 
     tracks=[]
     for d in docs:
+        formats=d.get("format") or []
+        if isinstance(formats,str): formats=[formats]
+        if formats and not any("flac" in str(v).lower() for v in formats):
+            continue
         if not d.get("identifier"):
             continue
         i=str(d["identifier"])
@@ -114,6 +128,9 @@ def search():
 
 @app.get("/stream/<path:track_id>")
 def stream(track_id):
+    quality=(request.args.get("quality") or "lossless").lower()
+    if quality != "lossless":
+        return jsonify({"error":"requested quality is not available"}),404
     x=best_flac(track_id.strip())
     if not x: return jsonify({"error":"track not found"}),404
     sr=x.get("sampleRate"); bd=x.get("bitDepth")
