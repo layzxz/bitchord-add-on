@@ -3,7 +3,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 app = Flask(__name__)
 
@@ -11,7 +11,7 @@ SEARCH = "https://archive.org/advancedsearch.php"
 META = "https://archive.org/metadata/{}"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "Layz-BitChord-Addon/1.2.0"})
+S.headers.update({"User-Agent": "Layz-BitChord-Addon/1.3.0"})
 
 def num(value):
     if value in (None, ""):
@@ -178,7 +178,7 @@ def manifest():
     return jsonify({
         "id": "layzxz.bitchord-flac",
         "name": "Layz Add On",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "resources": ["search", "stream"],
         "settings": [{
             "key": "quality",
@@ -297,6 +297,60 @@ def search():
 
     return jsonify({"tracks": tracks[:20]})
 
+@app.get("/media/<path:track_id>")
+def media(track_id):
+    """Proxy the FLAC so BitChord receives an explicit audio/flac response.
+
+    Internet Archive may serve downloadable FLACs with a generic content type.
+    BitChord deliberately bases its Lossless/Hi-Res badge on the codec it
+    actually decodes, so the addon must make the media type unambiguous while
+    preserving byte ranges for seeking.
+    """
+    identifier = track_id.strip()
+    filename = request.args.get("file", "").strip()
+    if not identifier or not filename or not filename.lower().endswith(".flac"):
+        return jsonify({"error": "media not found"}), 404
+
+    url = file_url(identifier, filename)
+    headers = {}
+    for name in ("Range", "If-Range", "Accept", "User-Agent"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+
+    try:
+        upstream = S.get(url, headers=headers, timeout=(5, 30), stream=True)
+        upstream.raise_for_status()
+    except requests.RequestException:
+        return jsonify({"error": "media unavailable"}), 502
+
+    response_headers = {}
+    for name in ("Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"):
+        value = upstream.headers.get(name)
+        if value:
+            response_headers[name] = value
+    response_headers["Content-Type"] = "audio/flac"
+    response_headers["Cache-Control"] = "public, max-age=300"
+
+    if request.method == "HEAD":
+        upstream.close()
+        return Response(status=upstream.status_code, headers=response_headers)
+
+    def chunks():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        stream_with_context(chunks()),
+        status=upstream.status_code,
+        headers=response_headers,
+        direct_passthrough=True,
+    )
+
 @app.get("/stream/<path:track_id>")
 def stream(track_id):
     quality = (request.args.get("quality") or "lossless").lower()
@@ -314,8 +368,10 @@ def stream(track_id):
     sample_rate = result.get("sampleRate")
     bit_depth = result.get("bitDepth")
 
+    proxy = request.url_root.rstrip("/") + "/media/" + quote(identifier, safe="") + "?file=" + quote(result["filename"], safe="")
+
     return jsonify({
-        "url": result["url"],
+        "url": proxy,
         "format": "flac",
         "quality": quality_text(bit_depth, sample_rate),
         "codec": "flac",
