@@ -5,141 +5,330 @@ from urllib.parse import quote
 import requests
 from flask import Flask, jsonify, request
 
-app=Flask(__name__)
-SEARCH="https://archive.org/advancedsearch.php"
-META="https://archive.org/metadata/{}"
-S=requests.Session()
-S.headers.update({"User-Agent":"Layz-BitChord-Addon/1.0"})
+app = Flask(__name__)
 
-def num(v):
-    if v in (None,""): return None
-    m=re.search(r"\d+(?:\.\d+)?",str(v))
-    if not m: return None
-    n=float(m.group()); return int(n) if n.is_integer() else n
+SEARCH = "https://archive.org/advancedsearch.php"
+META = "https://archive.org/metadata/{}"
 
-def pick(d,*keys):
-    for k in keys:
-        if d.get(k) not in (None,""): return d[k]
+S = requests.Session()
+S.headers.update({"User-Agent": "Layz-BitChord-Addon/1.2.0"})
+
+def num(value):
+    if value in (None, ""):
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", str(value))
+    if not m:
+        return None
+    n = float(m.group())
+    return int(n) if n.is_integer() else n
+
+def pick(data, *keys):
+    for key in keys:
+        if data.get(key) not in (None, ""):
+            return data[key]
     return None
 
-def file_url(i,n):
-    return "https://archive.org/download/"+quote(i,safe="")+"/"+quote(n,safe="")
+def file_url(identifier, filename):
+    return (
+        "https://archive.org/download/"
+        + quote(identifier, safe="")
+        + "/"
+        + quote(filename, safe="")
+    )
 
-def streaminfo(u):
+def creator(value):
+    if isinstance(value, list):
+        return str(value[0]) if value else "Internet Archive"
+    return str(value) if value else "Internet Archive"
+
+def metadata(identifier, timeout=(3, 8)):
     try:
-        r=S.get(u,headers={"Range":"bytes=0-63"},timeout=(5,12),stream=True)
-        r.raise_for_status(); d=r.raw.read(64); r.close()
-        if len(d)<42 or d[:4]!=b"fLaC" or (d[4]&127)!=0: return None,None
-        p=int.from_bytes(d[18:28],"big")
-        sr=p>>44; bd=((p>>36)&31)+1
-        return (sr if 1000<=sr<=768000 else None),(bd if 4<=bd<=32 else None)
-    except requests.RequestException: return None,None
+        r = S.get(
+            META.format(quote(identifier, safe="")),
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError):
+        return None
 
-def inspect(i,item):
-    n=str(item.get("name","")); u=file_url(i,n)
-    sr=num(pick(item,"sample_rate","samplerate","sampleRate"))
-    bd=num(pick(item,"bit_depth","bitdepth","bitDepth"))
-    if sr is None or bd is None:
-        a,b=streaminfo(u); sr=sr if sr is not None else a; bd=bd if bd is not None else b
-    return {"url":u,"filename":n,"sampleRate":sr,"bitDepth":bd,
-            "length":num(item.get("length")),"size":num(item.get("size")),
-            "bitrate":num(pick(item,"bitrate","bit_rate","bitRate"))}
+def inspect_flac(identifier, item):
+    filename = str(item.get("name", ""))
+    url = file_url(identifier, filename)
 
-def best_flac(i):
-    try:
-        r=S.get(META.format(quote(i,safe="")),timeout=(5,20)); r.raise_for_status(); meta=r.json()
-    except (requests.RequestException,ValueError): return None
-    c=[x for x in meta.get("files",[]) if str(x.get("name","")).lower().endswith(".flac")]
-    if not c: return None
-    c.sort(key=lambda x:num(x.get("size")) or 0,reverse=True)
-    out=[]
+    sample_rate = num(pick(item, "sample_rate", "samplerate", "sampleRate"))
+    bit_depth = num(pick(item, "bit_depth", "bitdepth", "bitDepth"))
+    bitrate = num(pick(item, "bitrate", "bit_rate", "bitRate"))
+
+    # FLAC STREAMINFO is read only when metadata did not expose the values.
+    if sample_rate is None or bit_depth is None:
+        try:
+            r = S.get(
+                url,
+                headers={"Range": "bytes=0-63"},
+                timeout=(3, 8),
+                stream=True,
+            )
+            r.raise_for_status()
+            data = r.raw.read(64)
+            r.close()
+
+            if len(data) >= 42 and data[:4] == b"fLaC" and (data[4] & 127) == 0:
+                packed = int.from_bytes(data[18:28], "big")
+                detected_rate = packed >> 44
+                detected_depth = ((packed >> 36) & 31) + 1
+                if sample_rate is None and 1000 <= detected_rate <= 768000:
+                    sample_rate = detected_rate
+                if bit_depth is None and 4 <= detected_depth <= 32:
+                    bit_depth = detected_depth
+        except requests.RequestException:
+            pass
+
+    return {
+        "url": url,
+        "filename": filename,
+        "sampleRate": sample_rate,
+        "bitDepth": bit_depth,
+        "length": num(item.get("length")),
+        "size": num(item.get("size")),
+        "bitrate": bitrate,
+    }
+
+def best_flac(identifier, meta=None):
+    meta = meta if meta is not None else metadata(identifier, timeout=(5, 20))
+    if not meta:
+        return None
+
+    candidates = [
+        item for item in meta.get("files", [])
+        if str(item.get("name", "")).lower().endswith(".flac")
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: num(item.get("size")) or 0, reverse=True)
+
+    inspected = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        fs=[pool.submit(inspect,i,x) for x in c[:10]]
-        for f in as_completed(fs):
-            try: out.append(f.result())
-            except Exception: pass
-    if not out: return None
-    out.sort(key=lambda x:(x.get("bitDepth") or 0,x.get("sampleRate") or 0,x.get("size") or 0),reverse=True)
-    return out[0]
+        futures = [
+            pool.submit(inspect_flac, identifier, item)
+            for item in candidates[:8]
+        ]
+        for future in as_completed(futures):
+            try:
+                inspected.append(future.result())
+            except Exception:
+                pass
 
-def creator(v):
-    if isinstance(v,list): return str(v[0]) if v else "Internet Archive"
-    return str(v) if v else "Internet Archive"
+    if not inspected:
+        return None
+
+    inspected.sort(
+        key=lambda item: (
+            item.get("bitDepth") or 0,
+            item.get("sampleRate") or 0,
+            item.get("size") or 0,
+        ),
+        reverse=True,
+    )
+    return inspected[0]
+
+def search_candidate(identifier):
+    meta = metadata(identifier, timeout=(3, 6))
+    if not meta:
+        return None
+
+    # Important: Internet Archive's item-level format field can say FLAC even
+    # when the downloadable files do not contain a FLAC file. Trust the files.
+    flacs = [
+        item for item in meta.get("files", [])
+        if str(item.get("name", "")).lower().endswith(".flac")
+    ]
+    if not flacs:
+        return None
+
+    flacs.sort(key=lambda item: num(item.get("size")) or 0, reverse=True)
+    item = flacs[0]
+
+    return {
+        "metadata": meta,
+        "file": item,
+    }
+
+def quality_text(bit_depth, sample_rate):
+    details = []
+    if bit_depth:
+        details.append(f"{bit_depth}-bit")
+    if sample_rate:
+        details.append(f"{sample_rate / 1000:g} kHz")
+    return "Lossless" + ((" · " + " / ".join(details)) if details else "")
+
+@app.get("/")
+def root():
+    return jsonify({
+        "name": "Layz Add On",
+        "status": "ok",
+        "manifest": "/manifest.json",
+        "search": "/search?q=...",
+        "stream": "/stream/{id}",
+    })
 
 @app.get("/manifest.json")
 def manifest():
     return jsonify({
-        "id":"layzxz.bitchord-flac",
-        "name":"Layz Add On",
-        "version":"1.1.0",
-        "resources":["search","stream"],
-        "settings":[{
-            "key":"quality",
-            "type":"select",
-            "default":"lossless",
-            "options":[{"label":"Lossless","value":"lossless"}]
-        }]
+        "id": "layzxz.bitchord-flac",
+        "name": "Layz Add On",
+        "version": "1.2.0",
+        "resources": ["search", "stream"],
+        "settings": [{
+            "key": "quality",
+            "type": "select",
+            "default": "lossless",
+            "options": [
+                {"label": "Lossless", "value": "lossless"}
+            ],
+        }],
     })
 
 @app.get("/health")
-def health(): return jsonify({"ok":True})
+def health():
+    return jsonify({"ok": True})
 
 @app.get("/search")
 def search():
-    q=(request.args.get("q") or "").strip()
+    q = (request.args.get("q") or "").strip()
+    quality = (request.args.get("quality") or "lossless").lower()
+
     if not q:
-        return jsonify({"tracks":[]})
+        return jsonify({"tracks": []})
+
+    # This addon intentionally serves only a true lossless tier.
+    if quality not in ("lossless", ""):
+        return jsonify({"tracks": []})
+
     try:
-        r=S.get(
+        r = S.get(
             SEARCH,
             params={
-                "q":f"mediatype:audio AND format:flac AND ({q})",
-                "fl[]":["identifier","title","creator","album","length","format"],
-                "rows":20,
-                "output":"json"
+                "q": f'mediatype:audio AND ({q})',
+                "fl[]": [
+                    "identifier",
+                    "title",
+                    "creator",
+                    "album",
+                    "length",
+                    "format",
+                ],
+                "rows": 20,
+                "output": "json",
             },
-            timeout=(5,10)
+            timeout=(5, 10),
         )
         r.raise_for_status()
-        docs=r.json().get("response",{}).get("docs",[])
-    except (requests.RequestException,ValueError) as e:
-        return jsonify({"tracks":[],"error":str(e)}),502
+        docs = r.json().get("response", {}).get("docs", [])
+    except (requests.RequestException, ValueError) as exc:
+        return jsonify({"tracks": [], "error": str(exc)}), 502
 
-    tracks=[]
-    for d in docs:
-        formats=d.get("format") or []
-        if isinstance(formats,str): formats=[formats]
-        if formats and not any("flac" in str(v).lower() for v in formats):
+    candidates = []
+    seen = set()
+
+    for doc in docs:
+        identifier = str(doc.get("identifier") or "").strip()
+        if not identifier or identifier in seen:
             continue
-        if not d.get("identifier"):
-            continue
-        i=str(d["identifier"])
+        seen.add(identifier)
+        candidates.append(doc)
+
+    confirmed = []
+    # Verify the actual item files instead of trusting IA's item-level format.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {
+            pool.submit(search_candidate, str(doc["identifier"])): doc
+            for doc in candidates
+        }
+        for future in as_completed(futures):
+            doc = futures[future]
+            try:
+                found = future.result()
+            except Exception:
+                found = None
+            if found:
+                confirmed.append((doc, found))
+
+    tracks = []
+    for doc, found in confirmed:
+        identifier = str(doc["identifier"])
+        meta = found["metadata"]
+        flac = found["file"]
+
+        title = str(
+            meta.get("metadata", {}).get("title")
+            or doc.get("title")
+            or identifier
+        )
+        artist = creator(
+            meta.get("metadata", {}).get("creator")
+            or doc.get("creator")
+        )
+        album = str(
+            meta.get("metadata", {}).get("album")
+            or doc.get("album")
+            or ""
+        )
+        duration = num(
+            flac.get("length")
+            or meta.get("metadata", {}).get("length")
+            or doc.get("length")
+        )
+
         tracks.append({
-            "id":i,
-            "title":str(d.get("title") or i),
-            "artist":creator(d.get("creator")),
-            "album":str(d.get("album") or ""),
-            "duration":num(d.get("length")),
-            "artworkURL":"https://archive.org/services/img/"+quote(i,safe=""),
-            "format":"flac",
-            "audioQuality":"LOSSLESS"
+            "id": identifier,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration": duration,
+            "artworkURL": (
+                "https://archive.org/services/img/"
+                + quote(identifier, safe="")
+            ),
+            "format": "flac",
+            "audioQuality": "LOSSLESS",
         })
-    return jsonify({"tracks":tracks[:20]})
+
+    return jsonify({"tracks": tracks[:20]})
 
 @app.get("/stream/<path:track_id>")
 def stream(track_id):
-    quality=(request.args.get("quality") or "lossless").lower()
+    quality = (request.args.get("quality") or "lossless").lower()
     if quality != "lossless":
-        return jsonify({"error":"requested quality is not available"}),404
-    x=best_flac(track_id.strip())
-    if not x: return jsonify({"error":"track not found"}),404
-    sr=x.get("sampleRate"); bd=x.get("bitDepth")
-    detail=[]
-    if bd: detail.append(f"{bd}-bit")
-    if sr: detail.append(f"{sr/1000:g} kHz")
-    return jsonify({"url":x["url"],"format":"flac","quality":"Lossless"+((" · "+" / ".join(detail)) if detail else ""),
-      "codec":"flac","container":"flac","manifest":"none","encrypted":False,
-      "sampleRate":sr,"bitDepth":bd,"bitrate":x.get("bitrate")})
+        return jsonify({"error": "requested quality is not available"}), 404
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
+    identifier = track_id.strip()
+    if not identifier:
+        return jsonify({"error": "track not found"}), 404
+
+    result = best_flac(identifier)
+    if not result:
+        return jsonify({"error": "track not found"}), 404
+
+    sample_rate = result.get("sampleRate")
+    bit_depth = result.get("bitDepth")
+
+    return jsonify({
+        "url": result["url"],
+        "format": "flac",
+        "quality": quality_text(bit_depth, sample_rate),
+        "codec": "flac",
+        "container": "flac",
+        "manifest": "none",
+        "encrypted": False,
+        "sampleRate": sample_rate,
+        "bitDepth": bit_depth,
+        "bitrate": result.get("bitrate"),
+    })
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+    )
