@@ -1,0 +1,1 @@
+{"id":"layzxz.bitchord-flac","name":"Layz Add On","version":"1.0.0","resources":["search","stream"],"settings":[{"key":"quality","type":"select","default":"lossless","options":[{"label":"Lossless","value":"lossless"},{"label":"High","value":"high"},{"label":"Low","value":"low"}]}]}
