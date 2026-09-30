@@ -77,27 +77,39 @@ def health(): return jsonify({"ok":True})
 @app.get("/search")
 def search():
     q=(request.args.get("q") or "").strip()
-    if not q: return jsonify({"tracks":[]})
+    if not q:
+        return jsonify({"tracks":[]})
     try:
-        r=S.get(SEARCH,params={"q":f"mediatype:audio AND ({q})","fl[]":["identifier","title","creator","album"],"rows":60,"output":"json"},timeout=(5,20))
-        r.raise_for_status(); docs=r.json().get("response",{}).get("docs",[])
+        r=S.get(
+            SEARCH,
+            params={
+                "q":f"mediatype:audio AND ({q})",
+                "fl[]":["identifier","title","creator","album","length"],
+                "rows":20,
+                "output":"json"
+            },
+            timeout=(5,10)
+        )
+        r.raise_for_status()
+        docs=r.json().get("response",{}).get("docs",[])
     except (requests.RequestException,ValueError) as e:
         return jsonify({"tracks":[],"error":str(e)}),502
-    order={str(d["identifier"]):i for i,d in enumerate(docs) if d.get("identifier")}
+
     tracks=[]
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fs={pool.submit(best_flac,str(d["identifier"])):d for d in docs if d.get("identifier")}
-        for f in as_completed(fs):
-            d=fs[f]
-            try: x=f.result()
-            except Exception: continue
-            if not x: continue
-            i=str(d["identifier"])
-            tracks.append({"id":i,"title":str(d.get("title") or x["filename"]),"artist":creator(d.get("creator")),
-              "album":str(d.get("album") or ""),"duration":x.get("length"),
-              "artworkURL":"https://archive.org/services/img/"+quote(i,safe=""),
-              "format":"flac","audioQuality":"LOSSLESS"})
-    tracks.sort(key=lambda t:order.get(t["id"],10**9))
+    for d in docs:
+        if not d.get("identifier"):
+            continue
+        i=str(d["identifier"])
+        tracks.append({
+            "id":i,
+            "title":str(d.get("title") or i),
+            "artist":creator(d.get("creator")),
+            "album":str(d.get("album") or ""),
+            "duration":num(d.get("length")),
+            "artworkURL":"https://archive.org/services/img/"+quote(i,safe=""),
+            "format":"flac",
+            "audioQuality":"LOSSLESS"
+        })
     return jsonify({"tracks":tracks[:20]})
 
 @app.get("/stream/<path:track_id>")
